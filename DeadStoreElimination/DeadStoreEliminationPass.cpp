@@ -14,34 +14,42 @@ struct MyDeadStoreEliminationPass : public FunctionPass {
 
   bool eliminateDeadStoresInBasicBlock(BasicBlock &BB) {
     bool Changed = false;
-
     std::vector<Instruction *> InstructionsToRemove;
     std::unordered_map<Value *, StoreInst *> LastStore;
+
+    for (BasicBlock *Succ : successors(&BB)) {
+      for (Instruction &I : *Succ) {
+        if (StoreInst *SI = dyn_cast<StoreInst>(&I)) {
+          Value *Ptr = SI->getPointerOperand();
+          if (LastStore.find(Ptr) == LastStore.end()) {
+            LastStore[Ptr] = SI;
+          }
+        }
+      }
+    }
 
     for (auto It = BB.rbegin(); It != BB.rend(); ++It) {
       Instruction &Instr = *It;
 
       if (StoreInst *SI = dyn_cast<StoreInst>(&Instr)) {
-        Value *Operand = SI->getOperand(1);
+        Value *Ptr = SI->getPointerOperand();
 
-        if (LastStore.find(Operand) != LastStore.end()) {
-          errs() << "Dead store eliminated: " << *SI << "\n";
+        if (LastStore.find(Ptr) != LastStore.end()) {
+          errs() << "Dead store eliminated:" << *SI << "\n";
           InstructionsToRemove.push_back(SI);
           Changed = true;
           continue;
         }
 
-        LastStore[Operand] = SI;
+        LastStore[Ptr] = SI;
       } else if (LoadInst *LI = dyn_cast<LoadInst>(&Instr)) {
-        Value *Operand = LI->getOperand(0);
-        LastStore.erase(Operand);
-      } else if (Instr.mayReadOrWriteMemory()) {
-        LastStore.clear();
+        Value *Ptr = LI->getPointerOperand();
+        LastStore.erase(Ptr);
       }
     }
 
-    for (Instruction *Instr : InstructionsToRemove) {
-      Instr->eraseFromParent();
+    for (Instruction *I : InstructionsToRemove) {
+      I->eraseFromParent();
     }
 
     return Changed;
@@ -49,12 +57,18 @@ struct MyDeadStoreEliminationPass : public FunctionPass {
 
   bool runOnFunction(Function &F) override {
     bool Changed = false;
+    bool LocalChanged;
 
-    for (BasicBlock &BB : F) {
-      if (eliminateDeadStoresInBasicBlock(BB)) {
-        Changed = true;
+    do {
+      LocalChanged = false;
+
+      for (BasicBlock &BB : F) {
+        if (eliminateDeadStoresInBasicBlock(BB)) {
+          LocalChanged = true;
+          Changed = true;
+        }
       }
-    }
+    } while (LocalChanged);
 
     return Changed;
   }
