@@ -1,4 +1,4 @@
-# Liveness analiza i Dead Store Elimination — prezentacija
+# Dead Store Elimination — prezentacija
 
 ## 1. Šta je dead store elimination?
 
@@ -206,7 +206,7 @@ bool runOnFunction(Function &F) override {
 
 ---
 
-## 6. Primer 1 — funkcija sa granjanjem
+## 6. Primer 1 — funkcija sa grananjem
 
 ```llvm
 define dso_local i32 @g(i32 noundef %0) #0 {
@@ -242,7 +242,7 @@ define dso_local i32 @g(i32 noundef %0) #0 {
 
 CFG: `entry → {6,13}`, `6 → {9,12}`, `9 → {12}`, `12 → {13}`, `13 → {}`.
 
-### Konačan rezultat fixpoint algoritma (do kojeg se stiže kroz 2-3 runde):
+### Konačan rezultat fixpoint algoritma (do kojeg se stiže kroz 3 runde):
 
 | Blok | LiveIn | LiveOut |
 |---|---|---|
@@ -251,6 +251,8 @@ CFG: `entry → {6,13}`, `6 → {9,12}`, `9 → {12}`, `12 → {13}`, `13 → {}
 | 9 | `{%2}` | `{}` |
 | 12 | `{}` | `{%3}` |
 | 13 | `{%3}` | `{}` |
+
+Ove vrednosti su tačne (verifikovano simulacijom algoritma). Ključno je **kako** se do njih dolazi: `LiveOut(6) = LiveIn(9) ∪ LiveIn(12) = {%2} ∪ {} = {%2}` — `%3` **nije** u ovom skupu, jer store u bloku `12` (`store 7, %3`) "ubija" potrebu za `%3` koja dolazi iz `13`, pre nego što ta potreba stigne unazad do `6`.
 
 ### Eliminacija u `entry` (LiveOut = `{%2,%3}`), unazad:
 
@@ -262,9 +264,39 @@ CFG: `entry → {6,13}`, `6 → {9,12}`, `9 → {12}`, `12 → {13}`, `13 → {}
 
 Nijedan store u `entry` nije mrtav — oba se koriste dalje (`%2` se čita u `6`/`9`, `%3` se čita u `13`).
 
+### Eliminacija u bloku `6` (LiveOut = `{%2}`), unazad:
+
+| Instr | Live pre provere | Odluka |
+|---|---|---|
+| `br` | `{%2}` | — |
+| `icmp` (%8) | `{%2}` | — |
+| `load %2` (%7) | `{%2}` | insert(%2) — no-op, već tu |
+| `store %3,5` | `{%2}` | `%3` **NIJE** live → **MRTAV** → briše se, `continue` |
+
+**`store i32 5, ptr %3` u bloku 6 se briše.** Iako se `%3` na kraju *čita* u bloku `13`, ta vrednost dolazi iz store-a u bloku `12`, koji prepisuje `%3` na svakom putu od `6` do `13` (`6→12` direktno, ili `6→9→12`) — pa vrednost upisana u bloku `6` nikad ne stigne do tog čitanja.
+
+### Eliminacija u bloku `9` (LiveOut = `{}`), unazad:
+
+| Instr | Live pre provere | Odluka |
+|---|---|---|
+| `br` | `{}` | — |
+| `store %2,%11` | `{}` | `%2` **NIJE** live → **MRTAV** → briše se, `continue` |
+| `add` (%11) | `{}` | — |
+| `load %2` (%10) | `{}` | insert(%2) → `{%2}` |
+
+**`store i32 %11, ptr %2` u bloku 9 se takođe briše** — izračunata vrednost `%11` se nigde dalje ne čita.
+
+### Eliminacija u blokovima `12` i `13`
+
+`LiveOut(12) = {%3}`, a store u bloku `12` upisuje baš u `%3` → store **ostaje** (live, koristi se u `13`). Blok `13` nema store instrukcija. Nema novih eliminacija u ova dva bloka.
+
 ### Najvažnija lekcija ovog primera
 
-Store `store i32 5, ptr %3` u bloku `6` (na ulazu u petlju/granu) **ostaje živ**, jer `LiveOut(12) = {%3}` — `%3` se čita na kraju u bloku `13`, bez obzira na to koji put se ide kroz `9`/`12`. Liveness preko CFG-a se prirodno "provlači" kroz fixpoint iteraciju čak i kroz grananja i (potencijalne) petlje, bez potrebe da algoritam posebno prati svaku putanju.
+Iako se na prvi pogled može učiniti da store `store i32 5, ptr %3` u bloku `6` mora ostati živ (jer se `%3` na kraju čita u bloku `13`), to **nije** slučaj. `LiveOut(BB)` zavisi samo od `LiveIn` **direktnih** sledbenika, ne tranzitivno od svih blokova dostupnih u CFG-u. Store `store i32 7, ptr %3` u bloku `12` **ubija** (kills) liveness za `%3` koja dolazi iz bloka `13` — ta potreba se ne propagira unazad kroz `12` do `6`, jer je `12` jedini put od `6`/`9` do `13`, i na svakoj od tih putanja `%3` biva prepisan pre nego što se pročita.
+
+Drugim rečima: **i `store i32 5, ptr %3` u bloku `6`, i `store i32 %11, ptr %2` u bloku `9`, su mrtvi store-ovi** i bivaju eliminisani u prvom prolazu pass-a kroz funkciju. Razlog: vrednost upisana u `%3` u bloku `6` se nikad ne čita pre nego što se u bloku `12` prepiše sa `7` (na oba moguća puta); a vrednost upisana u `%2` u bloku `9` se nikad ne čita posle tog store-a ni na jednoj putanji.
+
+Ovo je upravo poenta zašto je fixpoint preko CFG-a neophodan: lokalna intuicija ("`%3` se na kraju čita, pa svaki store u `%3` mora biti živ") je netačna ako postoji store dalje na putu koji ubija tu potrebu — algoritam to ispravno hvata, posmatrajući samo **direktne** sledbenike, korak po korak unazad kroz CFG.
 
 ---
 
@@ -307,7 +339,6 @@ Intuicija: (1) je odmah prepisan store-om (2) bez ikakvog čitanja između njih 
 
 ---
 
-
 ## 8. Sažetak — ceo tok pass-a
 
 ```
@@ -326,5 +357,6 @@ runOnFunction
 1. Liveness se računa **unazad** unutar bloka, jer zavisi od "budućnosti" koda.
 2. Liveness preko blokova zahteva **fixpoint iteraciju**, jer CFG može imati cikluse.
 3. Mrtav store = store čiji pointer **nije live** u trenutku kad se na njega naiđe (idući unazad).
-4. Brisanje store-ova može otkriti nove mrtve store-ove → **ponavlja se** ceo proces dok se ništa više ne menja.
-5. Bez alias analize, ispravnost pass-a zavisi od toga da se pointer-i **ne aliasuju** — ograničenje koje treba imati na umu pri korišćenju.
+4. `LiveOut` zavisi samo od **direktnih** sledbenika — store koji ubija (kills) liveness u jednom bloku sprečava da se ta potreba propagira dalje unazad kroz CFG, čak i ako se ista adresa kasnije čita "niz tok" iza tog store-a (vidi Primer 1, blok `6`).
+5. Brisanje store-ova može otkriti nove mrtve store-ove → **ponavlja se** ceo proces dok se ništa više ne menja.
+6. Bez alias analize, ispravnost pass-a zavisi od toga da se pointer-i **ne aliasuju** — ograničenje koje treba imati na umu pri korišćenju.
