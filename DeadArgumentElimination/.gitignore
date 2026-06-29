@@ -1,6 +1,5 @@
 .idea/
 *.ll
-*.md
 *.json
 .claude/
 materials/
